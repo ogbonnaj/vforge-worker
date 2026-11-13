@@ -1,4 +1,4 @@
-name: VFORGE worker
+name: .github/workflows/worker.yml
 
 on:
   schedule:
