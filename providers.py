@@ -4,6 +4,9 @@ Every provider has generate(image_path, seed, workdir) -> path of a model file.
 It raises QuotaError when the free GPU quota is used up (worker switches provider and
 remembers when to come back) and ProviderError for any other failure.
 
+TEXTURE RULE: a model is only accepted if it is textured. A white/untextured result raises
+ProviderError so the worker moves on to the next provider.
+
 NOTE: Space APIs belong to other people and change. These adapters were written from the
 Spaces' published APIs and could not be tested live while writing. Run
 `python backend/worker/main.py --check` to see each Space's real API.
@@ -73,9 +76,60 @@ def _valid_model(path):
     return True
 
 
+def _all_model_files(obj):
+    """Every model file path inside whatever a Space returned (white AND textured ones)."""
+    found = []
+    if isinstance(obj, str):
+        if obj.lower().endswith(GLB_EXT) and os.path.exists(obj):
+            found.append(obj)
+    elif isinstance(obj, dict):
+        for k in ("path", "value", "name"):
+            if k in obj:
+                found += _all_model_files(obj[k])
+    elif isinstance(obj, (list, tuple)):
+        for o in obj:
+            found += _all_model_files(o)
+    return found
+
+
+def _glb_json(path):
+    with open(path, "rb") as f:
+        head = f.read(12)
+        if len(head) < 12 or head[:4] != b"glTF":
+            return None
+        clen, ctype = struct.unpack("<I4s", f.read(8))
+        if ctype != b"JSON":
+            return None
+        return json.loads(f.read(clen).decode("utf-8"))
+
+
+def _is_textured(path, allow_vertex_colors=False):
+    """True if the GLB has a real texture image used by a material.
+    With allow_vertex_colors, per-vertex colours (COLOR_0) also count."""
+    if not path or not path.lower().endswith(".glb"):
+        return False
+    try:
+        js = _glb_json(path)
+    except Exception:
+        return False
+    if not js:
+        return False
+    if js.get("images") and js.get("textures"):
+        for m in js.get("materials", []):
+            if "baseColorTexture" in m.get("pbrMetallicRoughness", {}) or "emissiveTexture" in m:
+                return True
+    if allow_vertex_colors:
+        for mesh in js.get("meshes", []):
+            for prim in mesh.get("primitives", []):
+                if "COLOR_0" in prim.get("attributes", {}):
+                    return True
+    return False
+
+
 class SpaceProvider:
     name = "space"
     space = ""
+    allow_vertex_colors = False      # True = per-vertex colour counts as textured
 
     def __init__(self, hf_token=""):
         self.hf_token = hf_token
@@ -102,9 +156,16 @@ class SpaceProvider:
     def generate(self, image_path, seed, workdir):
         try:
             result = self.run(image_path, seed)
-            src = result if isinstance(result, str) and os.path.exists(result) else _first_model_file(result)
-            if not src:
+            files = _all_model_files(result)
+            if not files:
                 raise ProviderError("Space returned no model file")
+            src = None
+            for f in files:                      # pick the first file that really has texture
+                if _is_textured(f, self.allow_vertex_colors):
+                    src = f
+                    break
+            if not src:
+                raise ProviderError("%s returned a model with NO texture (white). Trying next provider." % self.name)
             ext = os.path.splitext(src)[1].lower() or ".glb"
             dest = os.path.join(workdir, "%s_%d%s" % (self.name, seed, ext))
             shutil.copyfile(src, dest)
@@ -126,7 +187,7 @@ class Hunyuan3D(SpaceProvider):
         return self.client().predict(
             image=handle_file(image_path), steps=30, guidance_scale=5.0, seed=seed,
             octree_resolution=256, check_box_rembg=True, num_chunks=8000,
-            randomize_seed=False, api_name="/shape_generation")
+            randomize_seed=False, api_name="/generation_all")   # returns white mesh + textured mesh
 
 
 class Trellis(SpaceProvider):
@@ -150,6 +211,7 @@ class Trellis(SpaceProvider):
 class TripoSR(SpaceProvider):
     name = "triposr"
     space = "stabilityai/TripoSR"
+    allow_vertex_colors = True       # TripoSR has no UV texture, only vertex colours
 
     def run(self, image_path, seed):
         from gradio_client import handle_file
