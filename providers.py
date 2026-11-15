@@ -336,6 +336,8 @@ class TextureProvider(SpaceProvider):
         except ProviderError:
             raise
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             raise classify(e)
 
 
