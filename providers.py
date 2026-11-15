@@ -419,6 +419,27 @@ class EmbodiedGenTexture(TextureProvider):
                          texture_size=self.TEXTURE_SIZE, api_name="/backproject_texture_v2")
 
 
+class TripoSGTexture(TextureProvider):
+    """VAST-AI/TripoSG /run_texture(image, mesh_path, seed) -> textured model. Seen live in the check log (15 Nov 2026).
+    Parameters are mapped by name from the Space's own API description, like the other texture adapters."""
+    name = "triposg_tex"
+    space = "VAST-AI/TripoSG"
+
+    def run_texture(self, mesh_path, image_path, seed, workdir, prompt, negative):
+        from gradio_client import handle_file
+        c = self.client()
+        eps = _endpoints(c)
+        if "/run_texture" not in eps:
+            raise ProviderError("TripoSG Space API changed (no /run_texture); run --check")
+        if "/start_session" in eps:
+            try:
+                c.predict(api_name="/start_session")
+            except Exception:
+                pass
+        vals = {"mesh": handle_file(mesh_path), "image": handle_file(image_path), "seed": seed}
+        return c.predict(api_name="/run_texture", **_build_kwargs(eps["/run_texture"], vals))
+
+
 class FakeTexture:
     """Test texture provider: a tiny textured triangle, no GPU, no internet. Run main.py --texture --fake-texture."""
     name = "fake_texture"
@@ -431,12 +452,13 @@ class FakeTexture:
         return dest
 
 
-TEXTURE_ORDER = ["embodiedgen_tex", "mvadapter_img2tex"]   # MV-Adapter Space was in RUNTIME_ERROR on 15 Nov 2026
+TEXTURE_ORDER = ["embodiedgen_tex", "triposg_tex", "mvadapter_img2tex"]   # MV-Adapter Space was in RUNTIME_ERROR on 15 Nov 2026
 
 
 def build_texture_providers(hf_token=""):
     """hf_token must be the TEXTURING account's token, never the shape account's."""
-    return {"mvadapter_img2tex": MVAdapterImg2Texture(hf_token), "embodiedgen_tex": EmbodiedGenTexture(hf_token)}
+    return {"mvadapter_img2tex": MVAdapterImg2Texture(hf_token), "embodiedgen_tex": EmbodiedGenTexture(hf_token),
+            "triposg_tex": TripoSGTexture(hf_token)}
 
 
 # ---- candidate replacement Spaces: only LOOKED AT by main.py --check (no GPU used, never used for jobs) ----
