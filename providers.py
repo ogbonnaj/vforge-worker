@@ -4,7 +4,7 @@ Every provider has generate(image_path, seed, workdir) -> path of a model file.
 It raises QuotaError when the free GPU quota is used up (worker switches provider and
 remembers when to come back) and ProviderError for any other failure.
 
-TEXTURE RULE: a model is only accepted if it is textured. A white/untextured result raises
+TEXTURE RULE: when WANT_TEXTURE is True a model is only accepted if it is textured. A white/untextured result raises
 ProviderError so the worker moves on to the next provider.
 
 NOTE: Space APIs belong to other people and change. These adapters were written from the
@@ -18,6 +18,10 @@ import struct
 import json
 
 GLB_EXT = (".glb", ".gltf", ".obj", ".ply")
+
+# False = shape only (white mesh): cheap, about 60 s of free GPU per model.
+# True  = shape + texture in one call: about 3 min of GPU, so only ~1 model per day on a free account.
+WANT_TEXTURE = False
 
 
 class ProviderError(Exception):
@@ -160,12 +164,15 @@ class SpaceProvider:
             if not files:
                 raise ProviderError("Space returned no model file")
             src = None
-            for f in files:                      # pick the first file that really has texture
-                if _is_textured(f, self.allow_vertex_colors):
-                    src = f
-                    break
-            if not src:
-                raise ProviderError("%s returned a model with NO texture (white). Trying next provider." % self.name)
+            if WANT_TEXTURE:
+                for f in files:                  # pick the first file that really has texture
+                    if _is_textured(f, self.allow_vertex_colors):
+                        src = f
+                        break
+                if not src:
+                    raise ProviderError("%s returned a model with NO texture (white). Trying next provider." % self.name)
+            else:
+                src = files[0]                   # shape-only mode: any valid model is fine
             ext = os.path.splitext(src)[1].lower() or ".glb"
             dest = os.path.join(workdir, "%s_%d%s" % (self.name, seed, ext))
             shutil.copyfile(src, dest)
@@ -178,6 +185,10 @@ class SpaceProvider:
             raise classify(e)
 
 
+def _hy_api():
+    return "/generation_all" if WANT_TEXTURE else "/shape_generation"
+
+
 class Hunyuan3D(SpaceProvider):
     name = "hunyuan3d"
     space = "tencent/Hunyuan3D-2"
@@ -187,7 +198,7 @@ class Hunyuan3D(SpaceProvider):
         return self.client().predict(
             image=handle_file(image_path), steps=30, guidance_scale=5.0, seed=seed,
             octree_resolution=256, check_box_rembg=True, num_chunks=8000,
-            randomize_seed=False, api_name="/generation_all")   # returns white mesh + textured mesh
+            randomize_seed=False, api_name=_hy_api())
 
 
 class Hunyuan3D21(SpaceProvider):
@@ -201,7 +212,7 @@ class Hunyuan3D21(SpaceProvider):
         return self.client().predict(
             image=handle_file(image_path), steps=30, guidance_scale=5.0, seed=seed,
             octree_resolution=256, check_box_rembg=True,
-            randomize_seed=False, api_name="/generation_all")
+            randomize_seed=False, api_name=_hy_api())
 
 
 class Trellis(SpaceProvider):
@@ -276,6 +287,13 @@ def build_providers(hf_token=""):
             "trellis": Trellis(hf_token), "triposr": TripoSR(hf_token)}
 
 
-# Order tried per quality setting. High-value images start with the best model.
-ORDER = {"high": ["hunyuan3d21", "trellis", "triposr"],
-         "low": ["hunyuan3d21", "trellis", "triposr"]}
+# Order tried per quality setting.
+if WANT_TEXTURE:
+    # hunyuan3d (2.0) is left out: its texture module is broken, so it spends GPU on the shape then fails.
+    ORDER = {"high": ["hunyuan3d21", "trellis", "triposr"],
+             "low": ["hunyuan3d21", "trellis", "triposr"]}
+else:
+    # shape only: 2.0 first (it worked for you), then 2.1. trellis/triposr are dead Spaces right now but fail instantly.
+    ORDER = {"high": ["hunyuan3d", "hunyuan3d21", "trellis", "triposr"],
+             "low": ["hunyuan3d", "hunyuan3d21", "trellis", "triposr"]}
+    
