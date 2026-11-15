@@ -131,7 +131,7 @@ class Hunyuan3D(SpaceProvider):
 
 class Trellis(SpaceProvider):
     name = "trellis"
-    space = "JeffreyXiang/TRELLIS"
+    space = "trellis-community/TRELLIS"      # was JeffreyXiang/TRELLIS (CONFIG_ERROR on 15 Nov 2026); community copy was running on 9 Nov
 
     def run(self, image_path, seed):
         from gradio_client import handle_file
@@ -437,6 +437,44 @@ TEXTURE_ORDER = ["embodiedgen_tex", "mvadapter_img2tex"]   # MV-Adapter Space wa
 def build_texture_providers(hf_token=""):
     """hf_token must be the TEXTURING account's token, never the shape account's."""
     return {"mvadapter_img2tex": MVAdapterImg2Texture(hf_token), "embodiedgen_tex": EmbodiedGenTexture(hf_token)}
+
+
+# ---- candidate replacement Spaces: only LOOKED AT by main.py --check (no GPU used, never used for jobs) ----
+CANDIDATE_SPACES = {
+    "stable_fast_3d": "stabilityai/stable-fast-3d",
+    "instantmesh": "TencentARC/InstantMesh",
+    "hunyuan3d_21": "tencent/Hunyuan3D-2.1",
+    "triposg": "VAST-AI/TripoSG",
+    "sparc3d": "ilcve21/Sparc3D",
+    "hi3dgen": "Stable-X/Hi3DGen",
+}
+
+
+class CandidateSpace(SpaceProvider):
+    def __init__(self, name, space, hf_token=""):
+        super().__init__(hf_token)
+        self.name, self.space = name, space
+
+
+def build_candidates(hf_token=""):
+    return {n: CandidateSpace(n, sp, hf_token) for n, sp in CANDIDATE_SPACES.items()}
+
+
+def api_summary(client):
+    """Short one-line-per-endpoint API summary: name(param, param*) -> returns.  * = required."""
+    info = client.view_api(return_format="dict", print_info=False)
+    lines = []
+    for name, ep in (info.get("named_endpoints") or {}).items():
+        params = ep.get("parameters") if isinstance(ep, dict) else ep
+        rets = ep.get("returns", []) if isinstance(ep, dict) else []
+        ps = ", ".join("%s%s:%s" % (p.get("parameter_name") or p.get("label"),
+                                   "" if p.get("parameter_has_default") else "*",
+                                   str(p.get("component", "?")).lower()) for p in (params or []))
+        rs = ", ".join(str(r.get("component", "?")).lower() for r in rets)
+        if not params and not rets:
+            continue                      # empty UI helper endpoints (lambda...) are noise
+        lines.append("  %s(%s) -> %s" % (name, ps, rs))
+    return lines
 
 
 def tiny_glb(path):

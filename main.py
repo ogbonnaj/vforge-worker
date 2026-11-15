@@ -31,7 +31,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from providers import (ORDER, TEXTURE_ORDER, FakeProvider, FakeTexture, ProviderError, QuotaError,  # noqa: E402
-                       IMG_EXT, _is_textured, _valid_model, build_providers, build_texture_providers)
+                       IMG_EXT, _is_textured, _valid_model, api_summary, build_candidates, build_providers,
+                       build_texture_providers)
 from supa import Supa, SupaError  # noqa: E402
 
 MAX_ATTEMPTS = int(os.environ.get("VFORGE_MAX_ATTEMPTS", "20"))   # full passes that failed (quota waits do not count)
@@ -295,6 +296,13 @@ def check(supa, hf, hf_tex=""):
             p.client().view_api()
         except Exception as e:
             print("cannot connect:", str(e)[:300])
+    print("\n######## CANDIDATE Spaces (only looked at, nothing is run, no GPU used) ########")
+    for name, p in build_candidates(hf).items():
+        print("\n== %s (%s) ==" % (name, p.space))
+        try:
+            print("\n".join(api_summary(p.client())))
+        except Exception as e:
+            print("cannot connect:", str(e)[:200])
 
 
 def peek(supa):
