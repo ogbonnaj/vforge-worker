@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'real = make white models, fake = test triangles, check = test connection, texture = texture ONE finished model, fake-texture = test of the texture step'
+        description: 'real = make white models, fake = test triangles, check = test connection, texture = texture ONE finished model, fake-texture = test of the texture step, texture-folder = texture what waits in bucket folder texture/in'
         type: choice
-        options: [real, fake, check, texture, fake-texture]
+        options: [real, fake, check, texture, fake-texture, texture-folder]
         default: real
       job_id:
         description: 'texture modes only: FULL job id from the Supabase jobs table (blank = most recent finished job)'
@@ -41,6 +41,7 @@ jobs:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_TEXTURE_TOKEN: ${{ secrets.HF_TEXTURE_TOKEN }}
     steps:
       - uses: actions/checkout@v6
 
@@ -70,5 +71,10 @@ jobs:
             check) python "$DIR/main.py" --check ;;
             texture) python "$DIR/main.py" --texture "$JOB_ID" --model "$MODEL" --remote-state ;;
             fake-texture) python "$DIR/main.py" --texture "$JOB_ID" --model "$MODEL" --fake-texture ;;
+            texture-folder) python "$DIR/main.py" --texture-folder --remote-state ;;
             *)     python "$DIR/main.py" --max-minutes 30 --remote-state ;;
           esac
+
+      - name: Texture items waiting in the bucket
+        if: always() && steps.peek.outputs.work == 'yes' && env.MODE == 'real'
+        run: python "$DIR/main.py" --texture-folder --remote-state

@@ -4,9 +4,6 @@ Every provider has generate(image_path, seed, workdir) -> path of a model file.
 It raises QuotaError when the free GPU quota is used up (worker switches provider and
 remembers when to come back) and ProviderError for any other failure.
 
-TEXTURE RULE: when WANT_TEXTURE is True a model is only accepted if it is textured. A white/untextured result raises
-ProviderError so the worker moves on to the next provider.
-
 NOTE: Space APIs belong to other people and change. These adapters were written from the
 Spaces' published APIs and could not be tested live while writing. Run
 `python backend/worker/main.py --check` to see each Space's real API.
@@ -18,10 +15,6 @@ import struct
 import json
 
 GLB_EXT = (".glb", ".gltf", ".obj", ".ply")
-
-# False = shape only (white mesh): cheap, about 60 s of free GPU per model.
-# True  = shape + texture in one call: about 3 min of GPU, so only ~1 model per day on a free account.
-WANT_TEXTURE = False
 
 
 class ProviderError(Exception):
@@ -80,60 +73,9 @@ def _valid_model(path):
     return True
 
 
-def _all_model_files(obj):
-    """Every model file path inside whatever a Space returned (white AND textured ones)."""
-    found = []
-    if isinstance(obj, str):
-        if obj.lower().endswith(GLB_EXT) and os.path.exists(obj):
-            found.append(obj)
-    elif isinstance(obj, dict):
-        for k in ("path", "value", "name"):
-            if k in obj:
-                found += _all_model_files(obj[k])
-    elif isinstance(obj, (list, tuple)):
-        for o in obj:
-            found += _all_model_files(o)
-    return found
-
-
-def _glb_json(path):
-    with open(path, "rb") as f:
-        head = f.read(12)
-        if len(head) < 12 or head[:4] != b"glTF":
-            return None
-        clen, ctype = struct.unpack("<I4s", f.read(8))
-        if ctype != b"JSON":
-            return None
-        return json.loads(f.read(clen).decode("utf-8"))
-
-
-def _is_textured(path, allow_vertex_colors=False):
-    """True if the GLB has a real texture image used by a material.
-    With allow_vertex_colors, per-vertex colours (COLOR_0) also count."""
-    if not path or not path.lower().endswith(".glb"):
-        return False
-    try:
-        js = _glb_json(path)
-    except Exception:
-        return False
-    if not js:
-        return False
-    if js.get("images") and js.get("textures"):
-        for m in js.get("materials", []):
-            if "baseColorTexture" in m.get("pbrMetallicRoughness", {}) or "emissiveTexture" in m:
-                return True
-    if allow_vertex_colors:
-        for mesh in js.get("meshes", []):
-            for prim in mesh.get("primitives", []):
-                if "COLOR_0" in prim.get("attributes", {}):
-                    return True
-    return False
-
-
 class SpaceProvider:
     name = "space"
     space = ""
-    allow_vertex_colors = False      # True = per-vertex colour counts as textured
 
     def __init__(self, hf_token=""):
         self.hf_token = hf_token
@@ -160,19 +102,9 @@ class SpaceProvider:
     def generate(self, image_path, seed, workdir):
         try:
             result = self.run(image_path, seed)
-            files = _all_model_files(result)
-            if not files:
+            src = result if isinstance(result, str) and os.path.exists(result) else _first_model_file(result)
+            if not src:
                 raise ProviderError("Space returned no model file")
-            src = None
-            if WANT_TEXTURE:
-                for f in files:                  # pick the first file that really has texture
-                    if _is_textured(f, self.allow_vertex_colors):
-                        src = f
-                        break
-                if not src:
-                    raise ProviderError("%s returned a model with NO texture (white). Trying next provider." % self.name)
-            else:
-                src = files[0]                   # shape-only mode: any valid model is fine
             ext = os.path.splitext(src)[1].lower() or ".glb"
             dest = os.path.join(workdir, "%s_%d%s" % (self.name, seed, ext))
             shutil.copyfile(src, dest)
@@ -185,10 +117,6 @@ class SpaceProvider:
             raise classify(e)
 
 
-def _hy_api():
-    return "/generation_all" if WANT_TEXTURE else "/shape_generation"
-
-
 class Hunyuan3D(SpaceProvider):
     name = "hunyuan3d"
     space = "tencent/Hunyuan3D-2"
@@ -198,21 +126,7 @@ class Hunyuan3D(SpaceProvider):
         return self.client().predict(
             image=handle_file(image_path), steps=30, guidance_scale=5.0, seed=seed,
             octree_resolution=256, check_box_rembg=True, num_chunks=8000,
-            randomize_seed=False, api_name=_hy_api())
-
-
-class Hunyuan3D21(SpaceProvider):
-    """Newer official Hunyuan3D-2.1 Space (shape + PBR texture). Same /generation_all API shape as 2.0:
-    returns (white mesh, textured glb, html, stats, seed). The base class picks the textured file."""
-    name = "hunyuan3d21"
-    space = "tencent/Hunyuan3D-2.1"
-
-    def run(self, image_path, seed):
-        from gradio_client import handle_file
-        return self.client().predict(
-            image=handle_file(image_path), steps=30, guidance_scale=5.0, seed=seed,
-            octree_resolution=256, check_box_rembg=True,
-            randomize_seed=False, api_name=_hy_api())
+            randomize_seed=False, api_name="/shape_generation")
 
 
 class Trellis(SpaceProvider):
@@ -236,7 +150,6 @@ class Trellis(SpaceProvider):
 class TripoSR(SpaceProvider):
     name = "triposr"
     space = "stabilityai/TripoSR"
-    allow_vertex_colors = True       # TripoSR has no UV texture, only vertex colours
 
     def run(self, image_path, seed):
         from gradio_client import handle_file
@@ -250,6 +163,264 @@ class TripoSR(SpaceProvider):
                 if isinstance(r, str) and r.lower().endswith(".glb"):
                     return r
         return res
+
+
+# ============================ TEXTURING (separate from shape generation) ============================
+# Texture Spaces take a finished white model (+ the reference image) and return a textured GLB.
+# They use their OWN Hugging Face token (HF_TEXTURE_TOKEN), so the shape providers' GPU quota is never touched.
+import zlib
+
+IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _glb_json(path):
+    """Return the JSON part of a .glb as a dict, or None."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+            if len(head) < 12 or head[:4] != b"glTF":
+                return None
+            ln, kind = struct.unpack("<I4s", f.read(8))
+            if kind != b"JSON":
+                return None
+            return json.loads(f.read(ln).decode("utf-8", "replace"))
+    except (OSError, ValueError, struct.error):
+        return None
+
+
+def _is_textured(path, allow_vertex_colors=False):
+    """True when the .glb really carries a texture image used by a material (or vertex colours if allowed)."""
+    g = _glb_json(path)
+    if not g:
+        return False
+    has_img = bool(g.get("images")) and bool(g.get("textures"))
+    used = False
+    for m in g.get("materials", []):
+        pbr = m.get("pbrMetallicRoughness", {})
+        if "baseColorTexture" in pbr or "emissiveTexture" in m:
+            used = True
+    if has_img and used:
+        return True
+    if allow_vertex_colors:
+        for me in g.get("meshes", []):
+            for pr in me.get("primitives", []):
+                if "COLOR_0" in pr.get("attributes", {}):
+                    return True
+    return False
+
+
+def _paths_from(obj, exts):
+    """All existing file paths with one of `exts` inside whatever a Space returned (keeps order)."""
+    out = []
+    if isinstance(obj, str):
+        if obj.lower().endswith(exts) and os.path.exists(obj):
+            out.append(obj)
+    elif isinstance(obj, dict):
+        for k in ("image", "path", "value", "name", "video"):
+            if k in obj:
+                out.extend(_paths_from(obj[k], exts))
+    elif isinstance(obj, (list, tuple)):
+        for o in obj:
+            out.extend(_paths_from(o, exts))
+    return out
+
+
+def _endpoints(client):
+    """The Space's named endpoints as {name: [params]} read from its own API description."""
+    info = client.view_api(return_format="dict", print_info=False)
+    res = {}
+    for name, ep in (info.get("named_endpoints") or {}).items():
+        res[name] = (ep.get("parameters") if isinstance(ep, dict) else ep) or []
+    return res
+
+
+def _kind(p):
+    """What a Space parameter is for: mesh, image, gallery, negative, prompt, seed, uvsize, random, other."""
+    text = ("%s %s" % (p.get("parameter_name", ""), p.get("label", ""))).lower()
+    comp = str(p.get("component", "")).lower()
+    if "negative" in text:
+        return "negative"
+    if comp == "model3d" or "mesh" in text or "3d model" in text or "glb" in text:
+        return "mesh"
+    if comp == "gallery":
+        return "gallery"
+    if comp == "image" or "image" in text or "reference" in text:
+        return "image"
+    if "prompt" in text or "description" in text:
+        return "prompt"
+    if "random" in text:
+        return "random"
+    if "seed" in text:
+        return "seed"
+    if "uv" in text and "size" in text:
+        return "uvsize"
+    return "other"
+
+
+def _kinds(params):
+    return [_kind(p) for p in params]
+
+
+def _build_kwargs(params, values):
+    """Map our values {mesh,image,gallery,prompt,negative,seed,uvsize} onto a Space's parameters by name.
+    Parameters we do not know are left out when they have a default; otherwise it is an error."""
+    kw = {}
+    for p in params:
+        k = _kind(p)
+        name = p.get("parameter_name") or p.get("label")
+        if k in values and values[k] is not None:
+            kw[name] = values[k]
+        elif k == "random":
+            kw[name] = False
+        elif not p.get("parameter_has_default", False):
+            raise ProviderError("this Space needs a value for '%s' that VFORGE does not know; run --check" % name)
+    return kw
+
+
+def _png_1x1(rgb=(200, 120, 60)):
+    def chunk(t, d):
+        c = struct.pack(">I", len(d)) + t + d
+        return c + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    raw = b"\x00" + bytes(rgb)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def tiny_textured_glb(path):
+    """A valid minimal GLB: one triangle with UVs and a 1x1 texture. Used by the fake texture provider."""
+    pos = struct.pack("<9f", 0, 0, 0, 1, 0, 0, 0, 1, 0)
+    uv = struct.pack("<6f", 0, 0, 1, 0, 0, 1)
+    png = _png_1x1()
+    png += b"\0" * (-len(png) % 4)
+    bin_ = pos + uv + png
+    js = {"asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
+          "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "TEXCOORD_0": 1}, "material": 0}]}],
+          "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}],
+          "textures": [{"source": 0}], "images": [{"bufferView": 2, "mimeType": "image/png"}],
+          "buffers": [{"byteLength": len(bin_)}],
+          "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962},
+                          {"buffer": 0, "byteOffset": 36, "byteLength": 24, "target": 34962},
+                          {"buffer": 0, "byteOffset": 60, "byteLength": len(png)}],
+          "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+                         "min": [0, 0, 0], "max": [1, 1, 0]},
+                        {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2"}]}
+    j = json.dumps(js, separators=(",", ":")).encode()
+    j += b" " * (-len(j) % 4)
+    total = 12 + 8 + len(j) + 8 + len(bin_)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<4sII", b"glTF", 2, total))
+        f.write(struct.pack("<I4s", len(j), b"JSON") + j)
+        f.write(struct.pack("<I4s", len(bin_), b"BIN\0") + bin_)
+
+
+class TextureProvider(SpaceProvider):
+    """Base for texture Spaces. texture() returns the path of a textured .glb or raises ProviderError/QuotaError."""
+    allow_vertex_colors = False
+    default_prompt = "high quality, detailed, realistic texture"
+
+    def run_texture(self, mesh_path, image_path, seed, workdir, prompt, negative):
+        raise NotImplementedError
+
+    def texture(self, mesh_path, image_path, seed, workdir, prompt="", negative=""):
+        try:
+            res = self.run_texture(mesh_path, image_path, seed, workdir, prompt or self.default_prompt, negative or "")
+            src = res if isinstance(res, str) and os.path.exists(res) else None
+            if not src:
+                found = _paths_from(res, (".glb",))
+                src = found[0] if found else None
+            if not src:
+                raise ProviderError("Space returned no .glb file (it may return another format)")
+            dest = os.path.join(workdir, "%s_%d_tex.glb" % (self.name, seed))
+            shutil.copyfile(src, dest)
+            return dest
+        except ProviderError:
+            raise
+        except Exception as e:
+            raise classify(e)
+
+
+class MVAdapterImg2Texture(TextureProvider):
+    """VAST-AI/MV-Adapter-Img2Texture: white mesh + reference image -> textured GLB.
+    Two calls inside the Space (make 6 views, then bake them onto the mesh). Endpoints are found from the Space's
+    own API description, not hard-coded, because the Space's author may rename them."""
+    name = "mvadapter_img2tex"
+    space = "VAST-AI/MV-Adapter-Img2Texture"
+    UV_SIZE = 2048
+
+    def run_texture(self, mesh_path, image_path, seed, workdir, prompt, negative):
+        from gradio_client import handle_file
+        c = self.client()
+        eps = _endpoints(c)
+        views_ep = bake_ep = None
+        for n, params in eps.items():
+            ks = _kinds(params)
+            if any(w in n.lower() for w in ("example", "session", "random")):
+                continue
+            if "mesh" in ks and "gallery" in ks:
+                bake_ep = bake_ep or n
+            elif "mesh" in ks and "image" in ks:
+                views_ep = views_ep or n
+        if not views_ep or not bake_ep:
+            raise ProviderError("MV-Adapter Space API is different from expected (views=%s, bake=%s); run --check"
+                                % (views_ep, bake_ep))
+        if "/start_session" in eps:
+            try:
+                c.predict(api_name="/start_session")
+            except Exception:
+                pass
+        vals = {"mesh": handle_file(mesh_path), "image": handle_file(image_path), "prompt": prompt,
+                "negative": negative or None, "seed": seed, "uvsize": self.UV_SIZE}
+        views = c.predict(api_name=views_ep, **_build_kwargs(eps[views_ep], vals))
+        pics = _paths_from(views, IMG_EXT)
+        if not pics:
+            raise ProviderError("the Space made no view images")
+        gal = [handle_file(p) for p in pics]
+        gp = [p for p in eps[bake_ep] if _kind(p) == "gallery"][0]
+        if "caption" in json.dumps(gp.get("python_type", "")).lower():
+            gal = [{"image": g, "caption": None} for g in gal]
+        vals2 = dict(vals, gallery=gal)
+        return c.predict(api_name=bake_ep, **_build_kwargs(eps[bake_ep], vals2))
+
+
+class EmbodiedGenTexture(TextureProvider):
+    """HorizonRobotics/EmbodiedGen-Texture-Gen: mesh + text (+ optional reference image) -> textured GLB."""
+    name = "embodiedgen_tex"
+    space = "HorizonRobotics/EmbodiedGen-Texture-Gen"
+
+    def run_texture(self, mesh_path, image_path, seed, workdir, prompt, negative):
+        from gradio_client import handle_file
+        c = self.client()
+        eps = _endpoints(c)
+        pick = None
+        for n, params in eps.items():
+            ks = _kinds(params)
+            if "mesh" in ks and "prompt" in ks and not any(w in n.lower() for w in ("example", "session", "random")):
+                pick = pick or n
+        if not pick:
+            raise ProviderError("EmbodiedGen Space API is different from expected; run --check")
+        vals = {"mesh": handle_file(mesh_path), "image": handle_file(image_path), "prompt": prompt,
+                "negative": negative or None, "seed": seed}
+        return c.predict(api_name=pick, **_build_kwargs(eps[pick], vals))
+
+
+class FakeTexture:
+    """Test texture provider: a tiny textured triangle, no GPU, no internet. Run main.py --texture --fake-texture."""
+    name = "fake_texture"
+    space = "(none)"
+    allow_vertex_colors = False
+
+    def texture(self, mesh_path, image_path, seed, workdir, prompt="", negative=""):
+        dest = os.path.join(workdir, "fake_%d_tex.glb" % seed)
+        tiny_textured_glb(dest)
+        return dest
+
+
+TEXTURE_ORDER = ["mvadapter_img2tex", "embodiedgen_tex"]
+
+
+def build_texture_providers(hf_token=""):
+    """hf_token must be the TEXTURING account's token, never the shape account's."""
+    return {"mvadapter_img2tex": MVAdapterImg2Texture(hf_token), "embodiedgen_tex": EmbodiedGenTexture(hf_token)}
 
 
 def tiny_glb(path):
@@ -283,17 +454,8 @@ class FakeProvider:
 
 
 def build_providers(hf_token=""):
-    return {"hunyuan3d21": Hunyuan3D21(hf_token), "hunyuan3d": Hunyuan3D(hf_token),
-            "trellis": Trellis(hf_token), "triposr": TripoSR(hf_token)}
+    return {"hunyuan3d": Hunyuan3D(hf_token), "trellis": Trellis(hf_token), "triposr": TripoSR(hf_token)}
 
 
-# Order tried per quality setting.
-if WANT_TEXTURE:
-    # hunyuan3d (2.0) is left out: its texture module is broken, so it spends GPU on the shape then fails.
-    ORDER = {"high": ["hunyuan3d21", "trellis", "triposr"],
-             "low": ["hunyuan3d21", "trellis", "triposr"]}
-else:
-    # shape only: 2.0 first (it worked for you), then 2.1. trellis/triposr are dead Spaces right now but fail instantly.
-    ORDER = {"high": ["hunyuan3d", "hunyuan3d21", "trellis", "triposr"],
-             "low": ["hunyuan3d", "hunyuan3d21", "trellis", "triposr"]}
-    
+# Order tried per quality setting. High-value images start with the best model.
+ORDER = {"high": ["hunyuan3d", "trellis", "triposr"], "low": ["triposr", "trellis", "hunyuan3d"]}

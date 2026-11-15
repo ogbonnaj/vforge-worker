@@ -120,3 +120,18 @@ class Supa:
             data = f.read()
         self._req("POST", "/storage/v1/object/%s/%s" % (self.bucket, self._enc(obj_path)), data,
                   {"Content-Type": content_type, "x-upsert": "true"})
+
+    def list_dir(self, prefix):
+        """Names directly inside a bucket folder (files and sub-folders). prefix like 'texture/in' (no trailing slash)."""
+        body = json.dumps({"prefix": prefix.strip("/"), "limit": 100, "offset": 0,
+                           "sortBy": {"column": "name", "order": "asc"}}).encode()
+        rows = self._req("POST", "/storage/v1/object/list/%s" % self.bucket, body,
+                         {"Content-Type": "application/json"}) or []
+        return [r["name"] for r in rows if r.get("name") and r["name"] != ".emptyFolderPlaceholder"]
+
+    def delete(self, obj_path):
+        try:
+            self._req("DELETE", "/storage/v1/object/%s/%s" % (self.bucket, self._enc(obj_path)))
+        except SupaError as e:
+            if e.status not in (400, 404):
+                raise
