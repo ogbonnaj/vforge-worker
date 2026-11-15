@@ -383,24 +383,40 @@ class MVAdapterImg2Texture(TextureProvider):
 
 
 class EmbodiedGenTexture(TextureProvider):
-    """HorizonRobotics/EmbodiedGen-Texture-Gen: mesh + text (+ optional reference image) -> textured GLB."""
+    """HorizonRobotics/EmbodiedGen-Texture-Gen: white mesh + text prompt (+ reference image) -> textured GLB.
+    Real flow seen in the Space's own API list (4 calls): make condition images from the mesh, make texture images
+    from the prompt, pick one image, bake it onto the mesh."""
     name = "embodiedgen_tex"
     space = "HorizonRobotics/EmbodiedGen-Texture-Gen"
+    STEPS = 30          # Space default is 50; fewer steps = less of the small daily GPU quota
+    TEXTURE_SIZE = 2048
 
     def run_texture(self, mesh_path, image_path, seed, workdir, prompt, negative):
         from gradio_client import handle_file
         c = self.client()
         eps = _endpoints(c)
-        pick = None
-        for n, params in eps.items():
-            ks = _kinds(params)
-            if "mesh" in ks and "prompt" in ks and not any(w in n.lower() for w in ("example", "session", "random")):
-                pick = pick or n
-        if not pick:
-            raise ProviderError("EmbodiedGen Space API is different from expected; run --check")
-        vals = {"mesh": handle_file(mesh_path), "image": handle_file(image_path), "prompt": prompt,
-                "negative": negative or None, "seed": seed}
-        return c.predict(api_name=pick, **_build_kwargs(eps[pick], vals))
+        need = ("/generate_condition", "/generate_texture_mvimages", "/get_selected_image", "/backproject_texture_v2")
+        missing = [n for n in need if n not in eps]
+        if missing:
+            raise ProviderError("EmbodiedGen Space API changed (missing %s); run --check" % ", ".join(missing))
+        if "/start_session" in eps:
+            try:
+                c.predict(api_name="/start_session")
+            except Exception:
+                pass
+        c.predict(mesh_path=handle_file(mesh_path), api_name="/generate_condition")
+        imgs = c.predict(prompt=prompt, num_inference_steps=self.STEPS, seed=seed,
+                         ip_img_path=handle_file(image_path), api_name="/generate_texture_mvimages")
+        cands = [(_paths_from(x, IMG_EXT) or [None])[0] for x in list(imgs or [])[:3]]
+        if len(cands) < 3 or None in cands:
+            raise ProviderError("the Space made no candidate texture images")
+        sel = c.predict(choice="sample1", sample1=handle_file(cands[0]), sample2=handle_file(cands[1]),
+                        sample3=handle_file(cands[2]), api_name="/get_selected_image")
+        chosen = _paths_from(sel, IMG_EXT)
+        if not chosen:
+            raise ProviderError("the Space returned no selected image")
+        return c.predict(mesh_path=handle_file(mesh_path), input_image=handle_file(chosen[0]),
+                         texture_size=self.TEXTURE_SIZE, api_name="/backproject_texture_v2")
 
 
 class FakeTexture:
@@ -415,7 +431,7 @@ class FakeTexture:
         return dest
 
 
-TEXTURE_ORDER = ["mvadapter_img2tex", "embodiedgen_tex"]
+TEXTURE_ORDER = ["embodiedgen_tex", "mvadapter_img2tex"]   # MV-Adapter Space was in RUNTIME_ERROR on 15 Nov 2026
 
 
 def build_texture_providers(hf_token=""):
