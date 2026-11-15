@@ -190,6 +190,20 @@ class Hunyuan3D(SpaceProvider):
             randomize_seed=False, api_name="/generation_all")   # returns white mesh + textured mesh
 
 
+class Hunyuan3D21(SpaceProvider):
+    """Newer official Hunyuan3D-2.1 Space (shape + PBR texture). Same /generation_all API shape as 2.0:
+    returns (white mesh, textured glb, html, stats, seed). The base class picks the textured file."""
+    name = "hunyuan3d21"
+    space = "tencent/Hunyuan3D-2.1"
+
+    def run(self, image_path, seed):
+        from gradio_client import handle_file
+        return self.client().predict(
+            image=handle_file(image_path), steps=30, guidance_scale=5.0, seed=seed,
+            octree_resolution=256, check_box_rembg=True,
+            randomize_seed=False, api_name="/generation_all")
+
+
 class Trellis(SpaceProvider):
     name = "trellis"
     space = "JeffreyXiang/TRELLIS"
@@ -258,8 +272,11 @@ class FakeProvider:
 
 
 def build_providers(hf_token=""):
-    return {"hunyuan3d": Hunyuan3D(hf_token), "trellis": Trellis(hf_token), "triposr": TripoSR(hf_token)}
+    return {"hunyuan3d21": Hunyuan3D21(hf_token), "hunyuan3d": Hunyuan3D(hf_token),
+            "trellis": Trellis(hf_token), "triposr": TripoSR(hf_token)}
 
 
 # Order tried per quality setting. High-value images start with the best model.
-ORDER = {"high": ["hunyuan3d", "trellis", "triposr"], "low": ["triposr", "trellis", "hunyuan3d"]}
+ORDER = {"high": ["hunyuan3d21", "hunyuan3d", "trellis", "triposr"],
+         "low": ["hunyuan3d21", "trellis", "triposr", "hunyuan3d"]}
+                                                            
