@@ -111,8 +111,9 @@ def call_with_timeout(fn, seconds):
 
 
 class Worker:
-    def __init__(self, supa, providers, sleeper=time.sleep, clock=time.time, remote_state=False):
+    def __init__(self, supa, providers, sleeper=time.sleep, clock=time.time, remote_state=False, tex_providers=None):
         self.supa, self.providers = supa, providers
+        self.tex_providers = tex_providers or {}
         self.sleep, self.clock = sleeper, clock
         self.remote_state = remote_state     # True in the cloud: rest times live in Supabase, not on the machine
         self.idle = False                    # last step() found no queued jobs at all
@@ -203,6 +204,14 @@ class Worker:
                 f, prov, err = self.make_one(job, image, seed=1000 + n * 7919, workdir=workdir)
                 if f:
                     ext = os.path.splitext(f)[1].lower() or ".glb"
+                    if self.tex_providers and ext == ".glb":
+                        tf, terr = _texture_with(self, self.tex_providers, list(TEXTURE_ORDER), f, image,
+                                                 1000 + n * 7919, workdir,
+                                                 job.get("positive_prompt") or "", job.get("negative_prompt") or "", jid[:8])
+                        if tf:
+                            f = tf
+                        else:
+                            log("job %s: texturing failed (%s), uploading white model" % (jid[:8], terr))
                     remote = "projects/%s/output/%s_%d%s" % (job["project_id"], job["asset_id"], n, ext)
                     self.supa.upload(remote, f, "model/gltf-binary" if ext == ".glb" else "application/octet-stream")
                     outputs.append(remote)
@@ -538,7 +547,8 @@ def main():
     deadline = None
     if "--max-minutes" in args:
         deadline = time.time() + float(args[args.index("--max-minutes") + 1]) * 60
-    w = Worker(supa, providers, remote_state=("--remote-state" in args and "--fake" not in args))
+    tex = {} if "--fake" in args or not hf_tex else build_texture_providers(hf_tex)
+    w = Worker(supa, providers, remote_state=("--remote-state" in args and "--fake" not in args), tex_providers=tex)
     try:
         n = supa.reset_processing(MAX_ATTEMPTS)
         if n:
