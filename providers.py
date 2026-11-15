@@ -277,6 +277,5 @@ def build_providers(hf_token=""):
 
 
 # Order tried per quality setting. High-value images start with the best model.
-ORDER = {"high": ["hunyuan3d21", "hunyuan3d", "trellis", "triposr"],
-         "low": ["hunyuan3d21", "trellis", "triposr", "hunyuan3d"]}
-                                                            
+ORDER = {"high": ["hunyuan3d21", "trellis", "triposr"],
+         "low": ["hunyuan3d21", "trellis", "triposr"]}
