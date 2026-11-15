@@ -8,11 +8,15 @@ Run:   python backend/worker/main.py            (real providers)
        python backend/worker/main.py --max-minutes 30 --remote-state   (cloud: stop when queue empty / all resting / time up)
        python backend/worker/main.py --peek     (cloud: is there work? writes work=yes/no to $GITHUB_OUTPUT)
 
+       python backend/worker/main.py --texture [JOB_ID] [--model N]   (texture ONE finished white model; blank id = latest done job)
+       python backend/worker/main.py --texture --fake-texture         (test of the texture step, no GPU)
+
 Run ONLY ONE worker at a time. Needs internet all the time.
 Secrets: SUPABASE_SERVICE_KEY (env var) or backend/worker/worker_secrets.json. Never put them in the app.
 """
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -22,7 +26,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from providers import (ORDER, FakeProvider, ProviderError, QuotaError, build_providers)  # noqa: E402
+from providers import (ORDER, TEXTURE_ORDER, FakeProvider, FakeTexture, ProviderError, QuotaError,  # noqa: E402
+                       _is_textured, _valid_model, build_providers, build_texture_providers)
 from supa import Supa, SupaError  # noqa: E402
 
 MAX_ATTEMPTS = int(os.environ.get("VFORGE_MAX_ATTEMPTS", "20"))   # full passes that failed (quota waits do not count)
@@ -266,7 +271,7 @@ def check(supa, hf):
         print("OK, %d queued job(s)" % n)
     except SupaError as e:
         print("FAILED -", e)
-    for name, p in build_providers(hf).items():
+    for name, p in list(build_providers(hf).items()) + list(build_texture_providers(hf).items()):
         print("\n==== %s (%s) ====" % (name, p.space))
         try:
             p.client().view_api()
@@ -297,6 +302,93 @@ def peek(supa):
     return 0
 
 
+def _arg_after(args, flag, default=None):
+    if flag in args:
+        i = args.index(flag)
+        if i + 1 < len(args) and not args[i + 1].startswith("--"):
+            return args[i + 1]
+    return default
+
+
+def texture_job(supa, hf, args):
+    """Texture ONE finished white model with a texture Space (manual stage, so GPU is only spent on models you pick).
+    --texture [JOB_ID]   blank = the most recently finished job
+    --model N            which of that job's models (1 or 2), default 1
+    Saves  <white model name>_tex.glb  next to the white model. Changes nothing else. Returns 0 on success, 1 if not."""
+    job_id = (_arg_after(args, "--texture") or "").strip()
+    try:
+        model_n = int(_arg_after(args, "--model", "1"))
+    except ValueError:
+        model_n = 1
+    fake = "--fake-texture" in args
+    if job_id and not re.fullmatch(r"[0-9a-fA-F-]{36}", job_id):
+        log("job id must be the FULL id (36 characters) from the Supabase jobs table, or blank for the latest job")
+        return 1
+    try:
+        job = supa.get_job(job_id) if job_id else supa.latest_done_job()
+    except SupaError as e:
+        log("cannot read the job: %s" % e)
+        return 1
+    if not job:
+        log("no such job found" if job_id else "no finished job found - make a white model first")
+        return 1
+    outs = job.get("outputs") or []
+    if isinstance(outs, str):
+        try:
+            outs = json.loads(outs)
+        except ValueError:
+            outs = []
+    white = [o for o in outs if "_tex" not in o]
+    if not white:
+        log("job %s has no finished white model yet" % job["id"][:8])
+        return 1
+    if not 1 <= model_n <= len(white):
+        log("job %s has %d model(s); --model %d does not exist" % (job["id"][:8], len(white), model_n))
+        return 1
+    remote_white = white[model_n - 1]
+
+    providers = {"fake_texture": FakeTexture()} if fake else build_texture_providers(hf)
+    order = ["fake_texture"] if fake else list(TEXTURE_ORDER)
+    w = Worker(supa, providers, remote_state=("--remote-state" in args and not fake))
+    workdir = tempfile.mkdtemp(prefix="vforge_tex_")
+    try:
+        image = os.path.join(workdir, "input" + os.path.splitext(job["input_path"])[1])
+        mesh = os.path.join(workdir, "white" + (os.path.splitext(remote_white)[1] or ".glb"))
+        try:
+            supa.download(job["input_path"], image)
+            supa.download(remote_white, mesh)
+        except SupaError as e:
+            log("cannot download the image or the white model: %s" % e)
+            return 1
+        seed = 1000 + model_n * 7919
+        for name in order:
+            if name not in providers:
+                continue
+            if w.until.get(name, 0) > w.clock():
+                log("%s is resting until %s, skipping" % (name, time.strftime("%H:%M", time.localtime(w.until[name]))))
+                continue
+            prov = providers[name]
+            try:
+                log("job %s model %d: texturing with %s" % (job["id"][:8], model_n, name))
+                out = call_with_timeout(lambda: prov.texture(mesh, image, seed, workdir), CALL_TIMEOUT)
+                if not _valid_model(out) or not _is_textured(out, getattr(prov, "allow_vertex_colors", False)):
+                    raise ProviderError("returned a model with NO texture")
+                remote_tex = os.path.splitext(remote_white)[0] + "_tex.glb"
+                supa.upload(remote_tex, out, "model/gltf-binary")
+                log("job %s: textured model saved as %s (provider %s)" % (job["id"][:8], remote_tex, name))
+                return 0
+            except QuotaError as e:
+                w.until[name] = w.clock() + e.wait_seconds
+                w._save_state()
+                log("%s quota used up, resting %d min; trying the next texture Space" % (name, e.wait_seconds // 60))
+            except ProviderError as e:
+                log("%s failed: %s" % (name, e))
+        log("no texture Space worked, nothing was changed. Try again later (the white model is untouched).")
+        return 1
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def main():
     args = sys.argv[1:]
     url, key, hf = load_config()
@@ -305,6 +397,8 @@ def main():
         return peek(supa)
     if "--check" in args:
         return check(supa, hf)
+    if "--texture" in args:
+        return texture_job(supa, hf, args)
     providers = {"fake": FakeProvider()} if "--fake" in args else build_providers(hf)
     if "--fake" in args:
         for q in ORDER:

@@ -49,6 +49,14 @@ class Supa:
         q = "status=eq.queued&order=created_at.asc&limit=%d" % limit
         return self._req("GET", "/rest/v1/jobs?" + q) or []
 
+    def get_job(self, job_id):
+        rows = self._req("GET", "/rest/v1/jobs?id=eq.%s&limit=1" % urllib.parse.quote(job_id, safe="-")) or []
+        return rows[0] if rows else None
+
+    def latest_done_job(self):
+        rows = self._req("GET", "/rest/v1/jobs?status=eq.done&order=updated_at.desc&limit=1") or []
+        return rows[0] if rows else None
+
     def count_processing(self):
         return self._req("GET", "/rest/v1/jobs?status=eq.processing&select=id") or []
 

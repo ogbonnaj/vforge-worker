@@ -1,0 +1,74 @@
+name: VFORGE worker
+
+on:
+  schedule:
+    - cron: '3-59/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'real = make white models, fake = test triangles, check = test connection, texture = texture ONE finished model, fake-texture = test of the texture step'
+        type: choice
+        options: [real, fake, check, texture, fake-texture]
+        default: real
+      job_id:
+        description: 'texture modes only: FULL job id from the Supabase jobs table (blank = most recent finished job)'
+        type: string
+        default: ''
+      model:
+        description: 'texture modes only: which model of the job to texture'
+        type: choice
+        options: ['1', '2']
+        default: '1'
+
+# only one worker at a time; a newer run waits for the running one
+concurrency:
+  group: vforge-worker
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  work:
+    # scheduled runs only start when the repo variable AUTO_RUN is set to on
+    if: github.event_name != 'schedule' || vars.AUTO_RUN == 'on'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      MODE: ${{ inputs.mode || 'real' }}
+      JOB_ID: ${{ inputs.job_id }}
+      MODEL: ${{ inputs.model || '1' }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Find worker folder
+        run: |
+          if [ -f backend/worker/main.py ]; then echo "DIR=backend/worker" >> "$GITHUB_ENV"; else echo "DIR=." >> "$GITHUB_ENV"; fi
+
+      - name: Is there work?
+        id: peek
+        run: |
+          if [ "$MODE" = "real" ]; then python3 "$DIR/main.py" --peek; else echo "work=yes" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/setup-python@v6
+        if: steps.peek.outputs.work == 'yes'
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        if: steps.peek.outputs.work == 'yes'
+        run: pip install -r "$DIR/requirements.txt"
+
+      - name: Run worker
+        if: steps.peek.outputs.work == 'yes'
+        run: |
+          case "$MODE" in
+            fake)  python "$DIR/main.py" --fake --max-minutes 20 ;;
+            check) python "$DIR/main.py" --check ;;
+            texture) python "$DIR/main.py" --texture "$JOB_ID" --model "$MODEL" --remote-state ;;
+            fake-texture) python "$DIR/main.py" --texture "$JOB_ID" --model "$MODEL" --fake-texture ;;
+            *)     python "$DIR/main.py" --max-minutes 30 --remote-state ;;
+          esac
